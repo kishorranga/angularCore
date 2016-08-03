@@ -1,0 +1,634 @@
+var gulp = require('gulp-help')(require('gulp'));
+
+var bytediff = require('gulp-bytediff');
+var changed = require('gulp-changed');
+var concat = require('gulp-concat');
+var csso = require('gulp-csso');
+var del = require('del');
+var ecstatic = require('ecstatic');
+var gutil = require('gulp-util');
+var http = require('http');
+var inject = require('gulp-inject');
+var jshint = require('gulp-jshint');
+var karma = require('karma').Server;
+var livereload = require('gulp-livereload');
+var merge = require('merge-stream');
+var minifyHtml = require('gulp-minify-html');
+var ngAnnotate = require('gulp-ng-annotate');
+var ngHtml2Js = require('gulp-ng-html2js');
+var plumber = require('gulp-plumber');
+var Q = require('q');
+var rename = require('gulp-rename');
+var runSequence = require('run-sequence');
+var less = require('gulp-less');
+var stylish = require('jshint-stylish');
+var uglify = require('gulp-uglify');
+var watch = require('gulp-watch');
+var war = require('gulp-war');
+var zip = require('gulp-zip');
+var brass = require('gulp-brass');
+var brassNPM = require('gulp-brass-npm');
+var path = require('path');
+var change = require('gulp-change');
+var shell = require('gulp-shell');
+var replace = require('gulp-replace');
+var gulpif = require('gulp-if');
+var args = require('yargs').argv;
+var bump = require('gulp-bump');
+var electron = require('gulp-electron');
+
+var buildTimestamp = new Date().toUTCString();
+
+// require package.json and our build configuration.
+var pkg = require('./package.json');
+var config = require('./config/build.config.js');
+
+var pkgDir = args.min ? config.minPkgDir : config.pkgDir;
+
+
+// once all of our files are 'built', we can now get them ready for production.
+var version = args.version ? args.version : pkg.version;
+version = version.replace('-', '_');
+var prodFileName = pkg.name + '-' + version;
+
+var opts = brassNPM.getOptions(pkg);
+opts.version = version;
+opts.prefix = 'Citi';
+opts.installDir = '/home/unoweb/uno_ui';
+var rpm = brass.create(opts);
+
+var prodOutputFiles = {
+    js: prodFileName + '.min.js',
+    css: prodFileName + '.min.css'
+};
+
+/**
+ * Compiles our LESS, renames it to match our package.json file, and moves it into our build directory.
+ */
+gulp.task('less', 'compiles less files into css', function () {
+    return gulp.src(config.appFiles.less)
+        .pipe(plumber())
+        .pipe(less())
+        .pipe(rename({basename: prodFileName}))
+        .pipe(gulp.dest(config.buildDir + '/assets'));
+});
+
+/**
+ * Cleans our /build and /dist folders before we start our build.
+ */
+gulp.task('clean', 'cleaning build directories', function () {
+    runSequence('clean-rpm');
+    return del.sync([config.buildDir, config.prodDir, config.pkgDir, config.minPkgDir, config.coverage]);
+});
+
+gulp.task('clean-rpm', 'cleaning build directories', function () {
+    return del.sync([rpm.buildDir]);
+});
+
+
+/**
+ * Does the appropriate copying of our files into the proper
+ * build directories. Only copy the changes files.
+ */
+gulp.task('copy', 'copies all relevant files to their proper location in /build during development', function () {
+
+    var assets = gulp.src('src/assets/**/*', {
+            base: 'src/assets/'
+        })
+        .pipe(changed(config.buildDir + '/assets'))
+        .pipe(gulp.dest(config.buildDir + '/assets'));
+
+    var app = gulp.src(config.appFiles.app)
+        .pipe(changed(config.buildDir))
+        .pipe(gulp.dest(config.buildDir));
+
+    var appJS = gulp.src(config.appFiles.js)
+        .pipe(changed(config.buildDir + '/src'))
+        .pipe(gulp.dest(config.buildDir + '/src'));
+
+    var packageJson = gulp.src('src/package.json')
+        .pipe(changed(config.buildDir))
+        .pipe(gulp.dest(config.buildDir));
+
+    var vendorJS = gulp.src(config.vendorFiles.js, {base: '.'})
+        .pipe(changed(config.buildDir))
+        .pipe(gulp.dest(config.buildDir));
+
+    var vendorCSS = gulp.src(config.vendorFiles.css, {base: '.'})
+        .pipe(changed(config.buildDir))
+        .pipe(gulp.dest(config.buildDir));
+
+    var vendorAssets = gulp.src(config.vendorFiles.assets, {base: '.'})
+        .pipe(changed(config.buildDir))
+        .pipe(gulp.dest(config.buildDir));
+
+    var vendorCopy = gulp.src(config.vendorFiles.copy, {base: '.'})
+        .pipe(changed(config.buildDir))
+        .pipe(gulp.dest(config.buildDir));
+
+    return merge([assets, app, appJS, packageJson, vendorJS, vendorCSS, vendorAssets, vendorCopy]);
+});
+
+/**
+ * Compiles our index.html and does things
+ */
+gulp.task('index', 'injects script and css files into our index.html file', function () {
+    var target = gulp.src('src/index.html');
+    var files = [].concat(config.vendorFiles.js, 'src/**/*.js', config.vendorFiles.css, 'templates-app.js', 'assets/' + prodFileName + '.css');
+    var sources = gulp.src(files, {
+        read: false,
+        cwd: config.buildDir
+    });
+
+    // inject the files, and copy it to the build directory
+    return target.pipe(inject(sources, {addRootSlash: false}))
+        .pipe(gulp.dest(config.buildDir));
+});
+
+/**
+ * Run test once and exit
+ */
+gulp.task('test', 'uses karma to directly run our unit tests', function (done) {
+    if (!args.skipTests) {
+        new karma({
+            configFile: __dirname + '/config/karma.conf.js',
+            singleRun: true
+        }, done).start();
+    }
+});
+
+/**
+ * Once our code is copied into /build, go through and annotate it.
+ */
+gulp.task('ngAnnotate', 'runs ngAnnotate on our code for proper `strictdi` conformity', function () {
+    return gulp.src(config.buildDir + '/src/**/*.js')
+        .pipe(plumber())
+        .pipe(ngAnnotate({add: true}))
+        .pipe(gulp.dest(config.buildDir + '/src'));
+});
+
+/**
+ * Compiles all of our application templates (*.tpl.html) into angular modules
+ * using $templateCache
+ */
+gulp.task('html2js', 'compiles .tpl.html files into javascript templates, injected into $templateCache', function () {
+    return gulp.src(config.appFiles.templates)
+        .pipe(plumber())
+        .pipe(minifyHtml({
+            empty: true,
+            spare: true,
+            quotes: true
+        }))
+        .pipe(ngHtml2Js({moduleName: 'templates-app'}))
+        .pipe(concat('templates-app.js'))
+        .pipe(uglify())
+        .pipe(gulp.dest(config.buildDir));
+});
+
+gulp.task('index-version', 'Replace timestamp on the index file', function () {
+    var indexVersion = args.prod ? pkg.version : version;
+    indexVersion += ' | ' + buildTimestamp;
+
+    gulp.src([path.join(config.buildDir, '/src/app/core/local-storage/local-storage.js')])
+        .pipe(replace('%%uno_version%%', pkg.version))
+        .pipe(gulp.dest(path.join(config.buildDir, '/src/app/core/local-storage/')));
+
+    return gulp.src([path.join(config.buildDir, '/index.html')])
+        .pipe(replace('%%build_version%%', indexVersion))
+        .pipe(gulp.dest(config.buildDir));
+});
+
+gulp.task('prod-index-version', 'Replace timestamp on the index file', function () {
+    var indexVersion = args.prod ? pkg.version : version;
+    indexVersion += ' | ' + buildTimestamp;
+
+    return gulp.src([path.join(config.prodDir, '/index.html')])
+        .pipe(replace('%%build_version%%', indexVersion))
+        .pipe(gulp.dest(config.prodDir));
+});
+
+/**
+ * Setup livereload to watch our build directory for changes, and reload.
+ */
+gulp.task('livereload', 'don\'t run this manually', function () {
+    livereload.listen();
+    gulp.watch(config.buildDir + '/**')
+        .on('change', livereload.changed);
+});
+
+/**
+ * Spin up a really simple node server to do development on.
+ */
+gulp.task('server', 'spins up a local development server on 0.0.0.0:1337', function () {
+    http.createServer(ecstatic({root: __dirname + '/build'}))
+        .listen(1337);
+    gutil.log(gutil.colors.blue('HTTP server listening on port 1337'));
+});
+
+/**
+ * Runs jsHint on all of our application javascript and runs
+ * it through a pretty reporter.
+ */
+gulp.task('jshint', 'runs jshint on our application code. reads a local copy of your .jshintrc in the root of the project', function () {
+    return gulp.src(config.appFiles.js)
+        .pipe(jshint())
+        .pipe(jshint.reporter(stylish))
+        .pipe(jshint.reporter('fail'));
+});
+
+/**
+ * Watches all of our source files, and runs the appropriate task
+ */
+gulp.task('watch', function () {
+    gulp.watch(['src/**/*.less'], ['less']);
+    gulp.watch(['src/**/*.js'], ['copy', 'jshint']);
+    gulp.watch([config.appFiles.templates], ['html2js']);
+    gulp.watch('src/index.html', ['index']);
+});
+
+/**
+ * does all of our production things.
+ */
+gulp.task('build-prod-js', 'builds production ready javascript version of vendor, application, and template javascript.', function () {
+
+    // concat all of our vendor js and app js files.
+    var files = [].concat(config.vendorFiles.js, config.buildDir + '/src/**/*.js', config.buildDir + '/templates-app.js');
+    return gulp.src(files)
+        .pipe(plumber())
+        .pipe(concat(prodOutputFiles.js))
+        .pipe(bytediff.start())
+        .pipe(uglify({
+            mangle: true,
+            compress: true,
+            preserveComments: false,
+            output: {
+                beautify: false
+            }
+        }))
+        .pipe(bytediff.stop())
+        .pipe(gulp.dest(config.prodDir + '/assets'));
+
+});
+
+gulp.task('build-prod-css', 'builds production ready CSS from /build', function () {
+    var files = [].concat(config.buildDir + '/vendor/**/*.css', config.buildDir + '/assets/*.css', config.buildDir + '/node_modules/**/*.css');
+    console.log(files);
+    return gulp.src(files)
+        .pipe(plumber())
+        .pipe(concat(prodOutputFiles.css))
+        .pipe(bytediff.start())
+        .pipe(csso())
+        .pipe(bytediff.stop())
+        .pipe(gulp.dest(config.prodDir + '/assets'));
+});
+
+/**
+ * Does the appropriate copying of our assets into the
+ * prod directory. Only copy the changes files.
+ */
+gulp.task('copy-prod-assets', 'copies all relevant files to their proper location in production folder', function () {
+
+    var assets = gulp.src([config.buildDir + '/assets/**/*', '!' + config.buildDir + '/assets/**/*.css', '!' + config.buildDir + '/assets/**/*.js'], {
+            base: config.buildDir + '/assets/'
+        })
+        .pipe(changed(config.prodDir + '/assets'))
+        .pipe(gulp.dest(config.prodDir + '/assets'));
+
+    var vendorAssets = gulp.src(config.vendorFiles.assets, {base: '.'})
+        .pipe(changed(config.prodDir))
+        .pipe(gulp.dest(config.prodDir));
+
+    return merge([assets, vendorAssets]);
+});
+
+gulp.task('build-prod-index', 'builds our index.html file for production', function () {
+
+    // copy over our templates
+    var indexFile = gulp.src('src/index.html');
+    var files = [].concat('assets/' + prodOutputFiles.css, 'assets/' + prodOutputFiles.js);
+
+    var sources = gulp.src(files, {
+        read: false,
+        cwd: config.prodDir
+    });
+
+    // inject the files, and copy it to the build directory
+    return indexFile.pipe(inject(sources, {addRootSlash: false}))
+        .pipe(gulp.dest(config.prodDir));
+});
+
+gulp.task('bump', function () {
+    gulp.src(['./bower.json', './package.json'])
+        .pipe(bump({type: 'patch'}))
+        .pipe(gulp.dest('./'));
+});
+
+gulp.task('war', function (callback) {
+    var sourceDirectory = args.min || args.prod ? config.prodDir : config.buildDir;
+    gulp.src([sourceDirectory + '/**/*.*'])
+        .pipe(war({
+            welcome: 'index.html',
+            displayName: 'uno',
+            mimeMapping: [
+                {
+                    extension: 'woff',
+                    mime_type: 'application/font-woff'
+                },
+                {
+                    extension: 'woff2',
+                    mime_type: 'application/font-woff2'
+                }
+            ]
+        }))
+        .pipe(zip(config.warName))
+        .pipe(gulp.dest(pkgDir));
+
+    callback();
+});
+
+gulp.task('zip', function (callback) {
+    var sourceDirectory = args.min || args.prod ? config.prodDir : config.buildDir;
+    gulp.src([sourceDirectory + '/**/*.*'])
+        .pipe(zip(config.zipName))
+        .pipe(gulp.dest(pkgDir));
+    callback();
+});
+
+gulp.task('setup', rpm.setupTask());
+
+gulp.task('files', function () {
+    var globs = args.zip ? [pkgDir + '/**/*.zip'] : [pkgDir + '/**/*.war'];
+    gulp.src(globs, {
+            mark: true,
+            cwd: '.',
+            base: ''
+        })
+        .pipe(gulp.dest(path.join(rpm.buildDir, 'tmp', opts.installDir, version)))
+        .pipe(rpm.files());
+});
+
+gulp.task('spec', ['files'], rpm.specTask());
+
+gulp.task('spec-uno', ['spec'], function () {
+    return gulp.src(path.join(rpm.buildDir, 'SPECS', 'spec'))
+        .pipe(change(function (contents) {
+            var specText = contents.substring(contents.indexOf('Summary'), contents.indexOf('%files'));
+            if (specText) {
+                specText = specText.replace('AutoProv:       0', 'BuildRoot: ' + rpm.buildDir + '\n' + 'Prefix: ' + rpm.buildDir);
+                specText = specText.replace('AutoReqProv:    0', 'Vendor: ' + opts.vendor + '\n' + 'Packager: ' + opts.vendor);
+
+                specText += '%define _topdir ' + rpm.buildDir + '\n';
+                specText += '%define installpath ' + opts.installDir + '\n';
+                specText += '%define __perl_provides /xenv/OS/ia64/RH6.4AS_64/x86_64/usr/lib/rpm/perl.prov' + '\n';
+                specText += '%define __perl_requires /xenv/OS/ia64/RH6.4AS_64/x86_64/usr/lib/rpm/perl.req' + '\n';
+                specText += '%define __check_files /xenv/OS/ia64/RH6.4AS_64/x86_64/usr/lib/rpm/check-files' + '\n';
+                specText += '\n\n';
+                specText += '%post' + '\n';
+                specText += '\n\n';
+                specText += 'cd %{installpath}' + '\n';
+                specText += '\n\n';
+                specText += 'if [[ -L default && -d default ]]' + '\n';
+                specText += 'then' + '\n';
+                specText += 'rm -rf default' + '\n';
+                specText += 'fi' + '\n';
+                specText += 'ln -s %{installpath}/%{version} %{installpath}/default' + '\n';
+                specText += '\n\n';
+                specText += '%files' + '\n';
+                specText += '\n\n';
+                specText += '%defattr(-,unoweb,unoweb)' + '\n';
+                specText += '#_FILESTART' + '\n';
+                specText += '%attr(755,unoweb,unoweb) ' + path.join('%{installpath}/%{version}', config.warName) + '\n';
+                specText += '#_FILEEND' + '\n';
+            }
+            return specText;
+        }))
+        .pipe(gulp.dest(path.join(rpm.buildDir, 'SPECS')))
+        .pipe(shell([
+            'ROOT_DIR=`pwd`', '/xenv/xenv -i ./uno_ui.env . << EOF'
+        ]));
+});
+
+gulp.task('spec-uno-zip', ['spec'], function () {
+    return gulp.src(path.join(rpm.buildDir, 'SPECS', 'spec'))
+        .pipe(change(function (contents) {
+            var specText = contents.substring(contents.indexOf('Summary'), contents.indexOf('%files'));
+            if (specText) {
+                specText = specText.replace('AutoProv:       0', 'BuildRoot: ' + rpm.buildDir + '\n' + 'Prefix: ' + rpm.buildDir);
+                specText = specText.replace('AutoReqProv:    0', 'Vendor: ' + opts.vendor + '\n' + 'Packager: ' + opts.vendor);
+
+                specText += '%define _topdir ' + rpm.buildDir + '\n';
+                specText += '%define installpath ' + opts.installDir + '\n';
+                specText += '%define _rpmfilename %%{ARCH}/%%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.zip.rpm' + '\n';
+                specText += '%define __perl_provides /xenv/OS/ia64/RH6.4AS_64/x86_64/usr/lib/rpm/perl.prov' + '\n';
+                specText += '%define __perl_requires /xenv/OS/ia64/RH6.4AS_64/x86_64/usr/lib/rpm/perl.req' + '\n';
+                specText += '%define __check_files /xenv/OS/ia64/RH6.4AS_64/x86_64/usr/lib/rpm/check-files' + '\n';
+                specText += '\n\n';
+                specText += '%post' + '\n';
+                specText += '\n\n';
+                specText += 'cd %{installpath}' + '\n';
+                specText += '\n\n';
+                specText += 'if [[ -L default && -d default ]]' + '\n';
+                specText += 'then' + '\n';
+                specText += 'rm -rf default' + '\n';
+                specText += 'fi' + '\n';
+                specText += 'ln -s %{installpath}/%{version} %{installpath}/default' + '\n';
+                specText += '\n\n';
+                specText += 'cd %{installpath}/default\n';
+                specText += 'unzip ' + config.zipName + '\n';
+                specText += 'rm -rf ' + config.zipName + '\n';
+                specText += '\n\n';
+                specText += '%files' + '\n';
+                specText += '\n\n';
+                specText += '%defattr(-,unoweb,unoweb)' + '\n';
+                specText += '#_FILESTART' + '\n';
+                specText += '%attr(755,unoweb,unoweb) ' + path.join('%{installpath}/%{version}', config.zipName) + '\n';
+                specText += '#_FILEEND' + '\n';
+            }
+            return specText;
+        }))
+        .pipe(gulp.dest(path.join(rpm.buildDir, 'SPECS')))
+        .pipe(shell([
+            'ROOT_DIR=`pwd`', '/xenv/xenv -i ./uno_ui.env . << EOF'
+        ]));
+});
+
+gulp.task('spec-uno-min', ['spec'], function () {
+    return gulp.src(path.join(rpm.buildDir, 'SPECS', 'spec'))
+        .pipe(change(function (contents) {
+            var specText = contents.substring(contents.indexOf('Summary'), contents.indexOf('%files'));
+            if (specText) {
+                specText = specText.replace('AutoProv:       0', 'BuildRoot: ' + rpm.buildDir + '\n' + 'Prefix: ' + rpm.buildDir);
+                specText = specText.replace('AutoReqProv:    0', 'Vendor: ' + opts.vendor + '\n' + 'Packager: ' + opts.vendor);
+
+                specText += '%define _topdir ' + rpm.buildDir + '\n';
+                specText += '%define installpath ' + opts.installDir + '\n';
+                specText += '%define _rpmfilename %%{ARCH}/%%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.min.rpm' + '\n';
+                specText += '%define __perl_provides /xenv/OS/ia64/RH6.4AS_64/x86_64/usr/lib/rpm/perl.prov' + '\n';
+                specText += '%define __perl_requires /xenv/OS/ia64/RH6.4AS_64/x86_64/usr/lib/rpm/perl.req' + '\n';
+                specText += '%define __check_files /xenv/OS/ia64/RH6.4AS_64/x86_64/usr/lib/rpm/check-files' + '\n';
+                specText += '\n\n';
+                specText += '%post' + '\n';
+                specText += '\n\n';
+                specText += 'cd %{installpath}' + '\n';
+                specText += '\n\n';
+                specText += 'if [[ -L default && -d default ]]' + '\n';
+                specText += 'then' + '\n';
+                specText += 'rm -rf default' + '\n';
+                specText += 'fi' + '\n';
+                specText += 'ln -s %{installpath}/%{version} %{installpath}/default' + '\n';
+                specText += '\n\n';
+                specText += '%files' + '\n';
+                specText += '\n\n';
+                specText += '%defattr(-,unoweb,unoweb)' + '\n';
+                specText += '#_FILESTART' + '\n';
+                specText += '%attr(755,unoweb,unoweb) ' + path.join('%{installpath}/%{version}', config.warName) + '\n';
+                specText += '#_FILEEND' + '\n';
+            }
+
+            return specText;
+        }))
+        .pipe(gulp.dest(path.join(rpm.buildDir, 'SPECS')))
+        .pipe(shell([
+            'ROOT_DIR=`pwd`', '/xenv/xenv -i ./uno_ui.env . << EOF'
+        ]));
+});
+
+gulp.task('spec-uno-zip-min', ['spec'], function () {
+    return gulp.src(path.join(rpm.buildDir, 'SPECS', 'spec'))
+        .pipe(change(function (contents) {
+            var specText = contents.substring(contents.indexOf('Summary'), contents.indexOf('%files'));
+            if (specText) {
+                specText = specText.replace('AutoProv:       0', 'BuildRoot: ' + rpm.buildDir + '\n' + 'Prefix: ' + rpm.buildDir);
+                specText = specText.replace('AutoReqProv:    0', 'Vendor: ' + opts.vendor + '\n' + 'Packager: ' + opts.vendor);
+
+                specText += '%define _topdir ' + rpm.buildDir + '\n';
+                specText += '%define installpath ' + opts.installDir + '\n';
+                specText += '%define _rpmfilename %%{ARCH}/%%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.zip.min.rpm' + '\n';
+                specText += '%define __perl_provides /xenv/OS/ia64/RH6.4AS_64/x86_64/usr/lib/rpm/perl.prov' + '\n';
+                specText += '%define __perl_requires /xenv/OS/ia64/RH6.4AS_64/x86_64/usr/lib/rpm/perl.req' + '\n';
+                specText += '%define __check_files /xenv/OS/ia64/RH6.4AS_64/x86_64/usr/lib/rpm/check-files' + '\n';
+                specText += '\n\n';
+                specText += '%post' + '\n';
+                specText += '\n\n';
+                specText += 'cd %{installpath}' + '\n';
+                specText += '\n\n';
+                specText += 'if [[ -L default && -d default ]]' + '\n';
+                specText += 'then' + '\n';
+                specText += 'rm -rf default' + '\n';
+                specText += 'fi' + '\n';
+                specText += 'ln -s %{installpath}/%{version} %{installpath}/default' + '\n';
+                specText += '\n\n';
+                specText += 'cd %{installpath}/default\n';
+                specText += 'unzip ' + config.zipName + '\n';
+                specText += 'rm -rf ' + config.zipName + '\n';
+                specText += '\n\n';
+                specText += '%files' + '\n';
+                specText += '\n\n';
+                specText += '%defattr(-,unoweb,unoweb)' + '\n';
+                specText += '#_FILESTART' + '\n';
+                specText += '%attr(755,unoweb,unoweb) ' + path.join('%{installpath}/%{version}', config.zipName) + '\n';
+                specText += '#_FILEEND' + '\n';
+            }
+
+            return specText;
+        }))
+        .pipe(gulp.dest(path.join(rpm.buildDir, 'SPECS')))
+        .pipe(shell([
+            'ROOT_DIR=`pwd`', '/xenv/xenv -i ./uno_ui.env . << EOF'
+        ]));
+});
+
+gulp.task('electron', function(callback) {
+    var desktopPkg = require('./build/package.json');
+
+    gulp.src("")
+        .pipe(electron({
+            src: './build',
+            packageJson: desktopPkg,
+            release: config.prodDir + '/desktop',
+            cache: './.electron',
+            version: 'v1.2.5',
+            packaging: true,
+            platforms: ['win32-ia32'],
+            platformResources: {
+                win: {
+                    "version-string": desktopPkg.version,
+                    "file-version": desktopPkg.version,
+                    "product-version": desktopPkg.version,
+                    "icon": './src/assets/uno-fav.ico'
+                }
+            },
+            requestOptions: {
+                proxy:  process.env.HTTPS_PROXY || process.env.https_proxy || config.proxy,
+                strictSSL: false
+            }
+        }))
+        .pipe(gulp.dest(""));
+
+    callback();
+});
+
+gulp.task('install-desktop-dependencies', function(callback) {
+    var install = require("gulp-install");
+
+    gulp.src([config.buildDir + '/package.json'])
+        .pipe(install({
+            noOptional: true
+        }));
+    
+    callback();
+});
+
+var winInstaller = require('electron-windows-installer');
+
+gulp.task('create-windows-installer', function(done) {
+    winInstaller({
+        appDirectory: './bin/desktop/v1.2.5/win32-ia32/',
+        outputDirectory: './release',
+        iconUrl: 'https://qa.citivelocity.com/uno/assets/uno-fav.ico'
+    }).then(done).catch(done);
+});
+
+gulp.task('rpm-build', ['files'], rpm.buildTask());
+
+/*The default task when no target is defined*/
+gulp.task('default', 'runs -> build, watch, server, livereload', function () {
+    runSequence('build', ['watch', 'server'], 'livereload');
+});
+
+/* Compiles into non minified dev ready application */
+gulp.task('build', 'runs -> clean, less, html2js, copy, test, index', function (callback) {
+    if (args.min || args.prod) {
+        runSequence(['clean'], ['less', 'html2js'], 'copy', 'ngAnnotate', 'test', 'index', 'index-version', ['build-prod-js', 'build-prod-css', 'copy-prod-assets'], 'build-prod-index', 'prod-index-version', callback); //'test', 
+    } else {
+        runSequence(['clean'], ['less', 'html2js'], 'copy', 'ngAnnotate', 'test', 'index', 'index-version', callback);
+    }
+});
+
+gulp.task('desktop', 'runs -> clean, less, html2js, copy, test, index', function (callback) {
+    runSequence('install-desktop-dependencies', 'electron', callback);
+});
+
+gulp.task('min', shell.task(['gulp build --min']));
+
+/* Packages either the build or prod output into rpm war
+ * Use --prod to specify prod rather than build
+ * */
+gulp.task('package', 'runs -> war, rpm-build', function (callback) {
+    var archiveTask = args.zip ? 'zip' : 'war';
+    var specTask = args.zip ? 'spec-uno-zip' : 'spec-uno';
+
+    // Run the tasks in sequence
+    if (args.min || args.prod) {
+        specTask = specTask + '-min';
+    }
+
+    console.log('archiveTask ==> ' + archiveTask);
+    console.log('specTask ==> ' + specTask);
+
+    runSequence('clean-rpm', archiveTask, 'setup', 'files', specTask, 'rpm-build', callback);
+});
+
+//cd build
+//npm install --production
+//electron-packager build --platform=win32 --arch=x64 --overwrite --out=build/desktop --version=0.37.8 --download.strictSSL=false
