@@ -60,6 +60,8 @@ var rpm = brass.create(opts);
 var prodOutputFiles = {
     js: prodFileName + '.min.js',
     css: prodFileName + '.min.css'
+    
+    
 };
 
 /**
